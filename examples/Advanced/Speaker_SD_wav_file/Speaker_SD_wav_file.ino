@@ -1,19 +1,24 @@
 #include <SD.h>
 #include <M5Unified.h>
+#include <atomic>
 
 #include <esp_log.h>
 
 static constexpr const gpio_num_t SDCARD_CSPIN = GPIO_NUM_4;
 
-static constexpr const char* files[] = {
-  "/file1.wav",
-  "/file2.wav",
-  "/file3.wav",
-};
-
-static constexpr const size_t buf_num = 3;
+/// Two buffers used alternately. A buffer is refilled only after the speaker
+/// task has released it, which it reports through setBufferReleaseCallback.
+static constexpr const size_t buf_num = 2;
 static constexpr const size_t buf_size = 1024;
 static uint8_t wav_data[buf_num][buf_size];
+// These flags are shared between tasks. Use std::atomic<bool> here;
+// plain bool or volatile does not safely share updates between tasks.
+static std::atomic<bool> wav_busy[buf_num] = { {false}, {false} };
+
+static void wav_released(void*, const void* data, uint8_t)
+{ // The speaker has finished using this buffer; it can be refilled now.
+  for (size_t i = 0; i < buf_num; ++i) { if (data == wav_data[i]) { wav_busy[i] = false; } }
+}
 
 struct __attribute__((packed)) wav_header_t
 {
@@ -97,15 +102,23 @@ static bool playSdWav(const char* filename)
 
   size_t idx = 0;
   while (data_len > 0) {
+    while (wav_busy[idx]) { M5.delay(1); } // wait until the speaker task has released this buffer
     size_t len = data_len < buf_size ? data_len : buf_size;
     len = file.read(wav_data[idx], len);
+    if (flg_16bit) { len &= ~(size_t)1; }
+    if (len == 0) { break; } // file shorter than the data chunk claims
     data_len -= len;
 
+    // busy is set before playRaw: the release can only come after the
+    // request is queued. playRaw returns false when nothing was queued.
+    wav_busy[idx] = true;
+    bool ok;
     if (flg_16bit) {
-      M5.Speaker.playRaw((const int16_t*)wav_data[idx], len >> 1, wav_header.sample_rate, wav_header.channel > 1, 1, 0);
+      ok = M5.Speaker.playRaw((const int16_t*)wav_data[idx], len >> 1, wav_header.sample_rate, wav_header.channel > 1, 1, 0);
     } else {
-      M5.Speaker.playRaw((const uint8_t*)wav_data[idx], len, wav_header.sample_rate, wav_header.channel > 1, 1, 0);
+      ok = M5.Speaker.playRaw((const uint8_t*)wav_data[idx], len, wav_header.sample_rate, wav_header.channel > 1, 1, 0);
     }
+    if (!ok) { wav_busy[idx] = false; }
     idx = idx < (buf_num - 1) ? idx + 1 : 0;
   }
   file.close();
@@ -117,6 +130,7 @@ void setup(void)
 {
   M5.begin();
 
+  M5.Speaker.setBufferReleaseCallback(nullptr, wav_released);
   SD.begin(SDCARD_CSPIN, SPI, 25000000);
 
   // M5.Speaker.setVolume(32);
@@ -124,8 +138,29 @@ void setup(void)
 
 void loop(void)
 {
-  for (auto filename : files) {
-    playSdWav(filename);
+  // Play every *.wav in the root of the card, in directory order.
+  auto dir = SD.open("/");
+  if (!dir) {
+    M5.Display.println("no SD card");
+    M5.delay(1000);
+    return;
+  }
+  size_t played = 0;
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    bool is_dir = file.isDirectory();
+    String name = file.name(); // a bare name or a full path, depending on the core version
+    file.close();
+    String lower = name;
+    lower.toLowerCase();
+    if (is_dir || !lower.endsWith(".wav")) { continue; }
+    String path = name.startsWith("/") ? name : "/" + name;
+    M5.Display.println(path);
+    if (playSdWav(path.c_str())) { ++played; }
     M5.delay(500);
+  }
+  dir.close();
+  if (played == 0) {
+    M5.Display.println("no *.wav found");
+    M5.delay(1000);
   }
 }

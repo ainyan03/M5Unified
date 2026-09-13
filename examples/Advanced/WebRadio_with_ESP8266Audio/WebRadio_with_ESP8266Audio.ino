@@ -1,5 +1,10 @@
+// Fill in here, or pass both from the build (-DWIFI_SSID=\"...\" -DWIFI_PASS=\"...\").
+#ifndef WIFI_SSID
 #define WIFI_SSID "SET YOUR WIFI SSID"
+#endif
+#ifndef WIFI_PASS
 #define WIFI_PASS "SET YOUR WIFI PASS"
+#endif
 
 
 #include <WiFi.h>
@@ -16,22 +21,27 @@
 #include <M5UnitLCD.h>
 #include <M5UnitOLED.h>
 #include <M5Unified.h>
+#include <atomic>
 
 /// set M5Speaker virtual channel (0-7)
 static constexpr uint8_t m5spk_virtual_channel = 0;
 
-/// set web radio station url
+/// set web radio station url (plain http MP3 streams; a station that cannot
+/// be opened is skipped automatically)
 static constexpr const char* station_list[][2] =
 {
-  {"thejazzstream"     , "http://wbgo.streamguys.net/thejazzstream"},
-  {"181-beatles_128k"  , "http://listen.181fm.com/181-beatles_128k.mp3"},
-  {"illstreet-128-mp3" , "http://ice1.somafm.com/illstreet-128-mp3"},
-  {"bootliquor-128-mp3", "http://ice1.somafm.com/bootliquor-128-mp3"},
-  {"dronezone-128-mp3" , "http://ice1.somafm.com/dronezone-128-mp3"},
-  {"Lite Favorites"    , "http://naxos.cdnstream.com:80/1255_128"},
+  {"Radio Paradise"    , "http://stream.radioparadise.com/mp3-128"},
+  {"FIP"               , "http://icecast.radiofrance.fr/fip-midfi.mp3"},
+  {"FIP Jazz"          , "http://icecast.radiofrance.fr/fipjazz-midfi.mp3"},
+  {"France Musique"    , "http://icecast.radiofrance.fr/francemusique-midfi.mp3"},
+  {"181.fm Beatles"    , "http://listen.181fm.com/181-beatles_128k.mp3"},
+  {"181.fm Classical"  , "http://listen.181fm.com/181-classical_128k.mp3"},
+  {"181.fm Jazz Mix"   , "http://listen.181fm.com/181-jazzmix_128k.mp3"},
+  {"KEXP"              , "http://kexp-mp3-128.streamguys1.com/kexp128.mp3"},
+  {"WQXR"              , "http://stream.wqxr.org/wqxr"},
+  {"BBC World Service" , "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service"},
   {"Classic FM"        , "http://media-ice.musicradio.com:80/ClassicFMMP3"},
-  {"MAXXED Out"        , "http://149.56.195.94:8015/steam"},
-  {"Asia Dream"        , "http://igor.torontocast.com:1025/;.-mp3"},
+  {"Lite Favorites"    , "http://naxos.cdnstream.com:80/1255_128"},
 };
 static constexpr const size_t stations = sizeof(station_list) / sizeof(station_list[0]);
 
@@ -44,14 +54,26 @@ class AudioOutputM5Speaker : public AudioOutput
       _virtual_ch = virtual_sound_channel;
     }
     virtual ~AudioOutputM5Speaker(void) {};
+    /// Call once after M5.begin() and before anything plays on the speaker
+    /// (the callback may only be registered before the first request).
+    /// Not done in the constructor: at global construction M5 may not exist.
+    void setup(void)
+    {
+      // Buffers are used in rotation and one is refilled only after the
+      // speaker task has released it, which it reports through this callback.
+      // Two would be enough for that handshake; the third keeps one buffer of
+      // slack against decoder and network jitter, as the old three-buffer
+      // form had.
+      _m5sound->setBufferReleaseCallback(this, bufferReleased);
+    }
     virtual bool begin(void) override { return true; }
     virtual bool ConsumeSample(int16_t sample[2]) override
     {
-      if (_tri_buffer_index < tri_buf_size)
+      if (_buffer_index < buf_size)
       {
-        _tri_buffer[_tri_index][_tri_buffer_index  ] = sample[0];
-        _tri_buffer[_tri_index][_tri_buffer_index+1] = sample[1];
-        _tri_buffer_index += 2;
+        _buffer[_index][_buffer_index  ] = sample[0];
+        _buffer[_index][_buffer_index+1] = sample[1];
+        _buffer_index += 2;
 
         return true;
       }
@@ -61,37 +83,67 @@ class AudioOutputM5Speaker : public AudioOutput
     }
     virtual void flush(void) override
     {
-      if (_tri_buffer_index)
+      if (_buffer_index)
       {
-        _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch);
-        _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
-        _tri_buffer_index = 0;
+        // busy is set before playRaw: the release can only come after the
+        // request is queued. playRaw returns false when nothing was queued.
+        _busy[_index] = true;
+        if (_m5sound->playRaw(_buffer[_index], _buffer_index, hertz, true, 1, _virtual_ch)) { _frames += _buffer_index / 2; }
+        else { _busy[_index] = false; }
+        if (++_index >= buf_count) { _index = 0; }
+        _buffer_index = 0;
+        while (_busy[_index]) { vTaskDelay(1); } // wait until the speaker task has released the next buffer
         ++_update_count;
       }
     }
     virtual bool stop(void) override
     {
+      // Let the queued buffers play out rather than cutting them: after the
+      // last release nothing refers to the buffers any more.
       flush();
-      _m5sound->stop(_virtual_ch);
-      for (size_t i = 0; i < 3; ++i)
+      for (size_t i = 0; i < buf_count; ++i)
       {
-        memset(_tri_buffer[i], 0, tri_buf_size * sizeof(int16_t));
+        while (_busy[i]) { vTaskDelay(1); }
+      }
+      for (size_t i = 0; i < buf_count; ++i)
+      {
+        memset(_buffer[i], 0, buf_size * sizeof(int16_t));
       }
       ++_update_count;
       return true;
     }
 
-    const int16_t* getBuffer(void) const { return _tri_buffer[(_tri_index + 2) % 3]; }
+    /// The most recently queued buffer, for the level/FFT display only: the
+    /// producer may start refilling it while it is being read, so a torn
+    /// frame is possible (as with any number of buffers when the reader lags).
+    const int16_t* getBuffer(void) const { return _buffer[(_index + buf_count - 1) % buf_count]; }
     const uint32_t getUpdateCount(void) const { return _update_count; }
+    /// stereo frames the speaker accepted so far, and their rate: what has
+    /// actually been played, unlike wall-clock time spent buffering. The
+    /// rate is 0 until the decoder has produced its first sample.
+    uint32_t getFrames(void) const { return _frames; }
+    uint32_t getRate(void) const { return hertz; }
 
   protected:
     m5::Speaker_Class* _m5sound;
     uint8_t _virtual_ch;
-    static constexpr size_t tri_buf_size = 640;
-    int16_t _tri_buffer[3][tri_buf_size];
-    size_t _tri_buffer_index = 0;
-    size_t _tri_index = 0;
+    static constexpr size_t buf_count = 3;
+    static constexpr size_t buf_size = 640;
+    int16_t _buffer[buf_count][buf_size];
+    // These flags are shared between tasks. Use std::atomic<bool> here;
+    // plain bool or volatile does not safely share updates between tasks.
+    std::atomic<bool> _busy[buf_count] = { {false}, {false}, {false} };
+    size_t _buffer_index = 0;
+    size_t _index = 0;
     size_t _update_count = 0;
+    uint32_t _frames = 0;
+
+    static void bufferReleased(void* args, const void* data, uint8_t)
+    {
+      auto me = (AudioOutputM5Speaker*)args;
+      // The speaker has finished using this buffer; it can be refilled now.
+      for (size_t i = 0; i < buf_count; ++i) { if (data == me->_buffer[i]) { me->_busy[i] = false; } }
+    }
 };
 
 
@@ -185,7 +237,13 @@ public:
   }
 };
 
-static constexpr const int preallocateBufferSize = 5 * 1024;
+// Stream buffer: about two seconds of a 128 kbps stream. Playback starts
+// only once it is mostly full and pauses to refill when it runs low, so a
+// network hiccup costs one gap instead of a burst of dropouts.
+static constexpr const int preallocateBufferSize = 32 * 1024;
+static constexpr const int bufferStartLevel = preallocateBufferSize * 3 / 4;
+static constexpr const int bufferLowLevel = preallocateBufferSize / 8;
+static constexpr const uint32_t bufferWaitMs = 3000;
 static constexpr const int preallocateCodecSize = 29192; // MP3 codec max mem needed
 static void* preallocateBuffer = nullptr;
 static void* preallocateCodec = nullptr;
@@ -203,12 +261,13 @@ static int16_t wave_y[WAVE_SIZE];
 static int16_t wave_h[WAVE_SIZE];
 static int16_t raw_data[WAVE_SIZE * 2];
 static int header_height = 0;
-static size_t station_index = 0;
+// Station numbers are shared between the UI and decode tasks, so use std::atomic.
+static std::atomic<size_t> playing_index { 0 }; // station the decode task is on; the UI navigates relative to it
 static char stream_title[128] = { 0 };
 static const char* meta_text[2] = { nullptr, stream_title };
 static const size_t meta_text_num = sizeof(meta_text) / sizeof(meta_text[0]);
 static uint8_t meta_mod_bits = 0;
-static volatile size_t playindex = ~0u;
+static std::atomic<size_t> playindex { ~0u }; // station requested from the UI; ~0u = none
 
 static void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string)
 {
@@ -241,34 +300,142 @@ static void stop(void)
   out.stop();
 }
 
+/// Request a station. Requests are absolute station numbers, so the UI and
+/// the decode task never update a shared counter.
 static void play(size_t index)
 {
-  playindex = index;
+  playindex = index % stations;
 }
+
+/// Ask for the station after `index` from the decode task - unless a
+/// selection made from the UI is already waiting, which wins.
+static void playNext(size_t index)
+{
+  if (++index >= stations) { index = 0; }
+  size_t none = ~0u;
+  playindex.compare_exchange_strong(none, index);
+}
+
+/// Sleep for `ms`, cut short when a station gets selected.
+static void waitUnlessSelected(uint32_t ms)
+{
+  uint32_t start = millis();
+  while (playindex == ~0u && millis() - start < ms) { M5.delay(10); }
+}
+
+/// Keep filling the stream buffer until it holds `level` bytes. Returns false
+/// when a station was selected meanwhile; sets *timed_out when the stream
+/// could not deliver within bufferWaitMs (play on with what there is).
+static bool waitForBuffer(int level, bool* timed_out)
+{
+  *timed_out = false;
+  uint32_t start = millis();
+  while (buff->getFillLevel() < (uint32_t)level)
+  {
+    if (playindex != ~0u) { return false; }
+    if (millis() - start >= bufferWaitMs) { *timed_out = true; break; }
+    buff->loop();
+    M5.delay(1);
+  }
+  return true;
+}
+
+/// A station is counted as working only once this much audio has actually
+/// been played (buffering time does not count); one that fails earlier is
+/// skipped like one that could not be opened.
+static constexpr uint32_t stationOkSeconds = 2;
 
 static void decodeTask(void*)
 {
+  size_t failures = 0;    // stations that failed in a row
+  bool starved = false;   // the stream fell behind: play on, do not wait again until it caught up
+  bool confirmed = false; // the current station has played for stationOkSeconds
+  uint32_t frames_at_start = 0;
   for (;;)
   {
     M5.delay(1);
     if (playindex != ~0u)
     {
-      auto index = playindex;
-      playindex = ~0u;
+      auto index = playindex.exchange(~0u);
+      if (index >= stations) { index = 0; }
       stop();
+      playing_index = index;
+      starved = false;
+      confirmed = false;
       meta_text[0] = station_list[index][0];
       stream_title[0] = 0;
       meta_mod_bits = 3;
       file = new AudioFileSourceICYStream(station_list[index][1]);
-      file->RegisterMetadataCB(MDCallback, (void*)"ICY");
-      buff = new AudioFileSourceBuffer(file, preallocateBuffer, preallocateBufferSize);
-      decoder = new AudioGeneratorMP3(preallocateCodec, preallocateCodecSize);
-      decoder->begin(buff, &out);
+      bool ok = file->isOpen();
+      if (ok)
+      {
+        file->RegisterMetadataCB(MDCallback, (void*)"ICY");
+        buff = new AudioFileSourceBuffer(file, preallocateBuffer, preallocateBufferSize);
+        // The buffer's very first read fills it wholesale (replacing, not
+        // adding to, anything loop() gathered before), so trigger that first,
+        // then let loop() top it up before decoding starts.
+        uint8_t dummy;
+        buff->read(&dummy, 0);
+        bool timed_out;
+        if (!waitForBuffer(bufferStartLevel, &timed_out)) { continue; }
+        starved = timed_out; // a slow stream: do not wait again until it catches up
+        decoder = new AudioGeneratorMP3(preallocateCodec, preallocateCodecSize);
+        ok = decoder->begin(buff, &out); // false if the stream broke meanwhile
+      }
+      if (ok)
+      {
+        frames_at_start = out.getFrames();
+        continue;
+      }
     }
-    if (decoder && decoder->isRunning())
+    else if (decoder && decoder->isRunning())
     {
-      if (!decoder->loop()) { decoder->stop(); }
+      if (!confirmed && out.getRate() != 0
+       && out.getFrames() - frames_at_start >= out.getRate() * stationOkSeconds)
+      {
+        confirmed = true;
+        failures = 0;
+      }
+      uint32_t level = buff->getFillLevel();
+      if (starved)
+      {
+        if (level >= (uint32_t)bufferStartLevel) { starved = false; }
+      }
+      else if (level < (uint32_t)bufferLowLevel)
+      { // running dry: refill before decoding on.
+        bool timed_out;
+        if (!waitForBuffer(bufferStartLevel, &timed_out)) { continue; }
+        starved = timed_out;
+      }
+      if (decoder->loop()) { continue; }
+      decoder->stop();
+      if (confirmed)
+      { // the stream ended or broke after playing: move on to the next station.
+        playNext(playing_index);
+        continue;
+      }
     }
+    else
+    {
+      continue;
+    }
+    // A station that could not be opened, broke during buffering, or stopped
+    // before stationOkSeconds of audio came out: skip it. Once every station failed in a
+    // row, wait a while before going round again. A selection from the UI
+    // cuts the wait short.
+    strncpy(stream_title, "(unavailable, skipping)", sizeof(stream_title) - 1);
+    meta_mod_bits |= 2;
+    stop();
+    if (++failures >= stations)
+    {
+      failures = 0;
+      waitUnlessSelected(5000);
+    }
+    else
+    {
+      waitUnlessSelected(500);
+    }
+    playNext(playing_index);
   }
 }
 
@@ -581,6 +748,7 @@ void setup(void)
   cfg.external_speaker.atomic_spk     = true;
 
   M5.begin(cfg);
+  out.setup();
 
   preallocateBuffer = malloc(preallocateBufferSize);
   preallocateCodec = malloc(preallocateCodecSize);
@@ -604,6 +772,9 @@ void setup(void)
   WiFi.disconnect();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  // Modem sleep makes the station receive only at DTIM intervals; a stream
+  // then arrives in bursts and the buffer drains between them.
+  WiFi.setSleep(false);
 
 #if defined ( WIFI_SSID ) &&  defined ( WIFI_PASS )
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -620,7 +791,7 @@ void setup(void)
 
   gfxSetup(&M5.Display);
 
-  play(station_index);
+  play(0);
 
   xTaskCreatePinnedToCore(decodeTask, "decodeTask", 4096, nullptr, 1, nullptr, PRO_CPU_NUM);
 }
@@ -653,14 +824,12 @@ void loop(void)
     {
     case 1:
       M5.Speaker.tone(1000, 100);
-      if (++station_index >= stations) { station_index = 0; }
-      play(station_index);
+      play(playing_index + 1);
       break;
 
     case 2:
       M5.Speaker.tone(800, 100);
-      if (station_index == 0) { station_index = stations; }
-      play(--station_index);
+      play(playing_index + stations - 1);
       break;
     }
   }

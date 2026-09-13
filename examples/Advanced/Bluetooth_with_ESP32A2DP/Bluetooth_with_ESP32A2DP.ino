@@ -2,6 +2,7 @@
 #include <M5UnitLCD.h>
 #include <M5UnitOLED.h>
 #include <M5Unified.h>
+#include <atomic>
 
 /// need ESP32-A2DP library. ( URL : https://github.com/pschatzmann/ESP32-A2DP/ )
 #include <BluetoothA2DPSink.h>
@@ -13,17 +14,25 @@ static constexpr uint8_t m5spk_virtual_channel = 0;
 static constexpr char bt_device_name[] = "ESP32";
 
 
+// zero samples shown while nothing is playing (see getBuffer)
+static const int16_t silent_wave[2048] = {};
+
 class BluetoothA2DPSink_M5Speaker : public BluetoothA2DPSink
 {
 public:
   BluetoothA2DPSink_M5Speaker(m5::Speaker_Class* m5sound, uint8_t virtual_channel = 0)
   : BluetoothA2DPSink()
   {
-    is_i2s_output = false; // I2S control by BluetoothA2DPSink is not required.
+    // The PCM goes to M5.Speaker through audio_data_callback below: no I2S
+    // output by the library. (Same call on the old and the current API.)
+    set_stream_reader(nullptr, false);
   }
 
   // get rawdata buffer for FFT.
-  const int16_t* getBuffer(void) const { return _tri_buf[_export_index]; }
+  /// The most recently queued buffer, for the FFT display only. The storage
+  /// is fixed, so the display may read a frame that is being refilled (torn),
+  /// but never freed memory. Silence (after clear()) is a zero buffer.
+  const int16_t* getBuffer(void) const { return _silent ? silent_wave : _buf[_export_index]; }
 
   const char* getMetaData(size_t id, bool clear_flg = true) { if (clear_flg) { _meta_bits &= ~(1<<id); } return (id < metatext_num) ? _meta_text[id] : nullptr; }
 
@@ -31,20 +40,40 @@ public:
   void clearMetaUpdateInfo(void) { _meta_bits = 0; }
 
   void clear(void)
+  { // The display shows silence from here until audio arrives again. The
+    // buffers themselves are left alone: the speaker task may still read one.
+    _silent = true;
+  }
+
+  // Two buffers used alternately. A buffer is refilled only after the speaker
+  // task has released it, which it reports through setBufferReleaseCallback.
+  static void bufferReleased(void* args, const void* data, uint8_t)
   {
-    for (int i = 0; i < 3; ++i)
-    {
-      if (_tri_buf[i]) { memset(_tri_buf[i], 0, _tri_buf_size[i]); }
-    }
+    auto me = (BluetoothA2DPSink_M5Speaker*)args;
+    // The speaker has finished using this buffer; it can be refilled now.
+    for (int i = 0; i < 2; ++i) { if (data == me->_buf[i]) { me->_busy[i] = false; } }
+  }
+
+  // Volume set from the phone (AVRCP absolute volume, 0-127) drives the
+  // speaker. The library's own software volume is bypassed with the output.
+  static void volumeChanged(int volume)
+  {
+    M5.Speaker.setVolume(volume * 255 / 127);
   }
 
   static constexpr size_t metatext_size = 128;
   static constexpr size_t metatext_num = 3;
 
 protected:
-  int16_t* _tri_buf[3] = { nullptr, nullptr, nullptr };
-  size_t _tri_buf_size[3] = { 0, 0, 0 };
-  size_t _tri_index = 0;
+  // Fixed storage (no reallocation): the addresses the release callback and
+  // the display compare against never change. Half of one A2DP packet fits.
+  static constexpr size_t buf_samples = 2048;
+  int16_t _buf[2][buf_samples];
+  // These flags are shared between tasks. Use std::atomic<bool> here;
+  // plain bool or volatile does not safely share updates between tasks.
+  std::atomic<bool> _busy[2] = { {false}, {false} };
+  std::atomic<bool> _silent { true };
+  size_t _index = 0;
   size_t _export_index = 0;
   char _meta_text[metatext_num][metatext_size];
   uint8_t _meta_bits = 0;
@@ -137,33 +166,40 @@ protected:
     BluetoothA2DPSink::av_hdl_avrc_evt(event, p_param);
   }
 
-  int16_t* get_next_buf(const uint8_t* src_data, uint32_t len)
+  int16_t* get_next_buf(const uint8_t* src_data, uint32_t& len)
   {
-    size_t tri = _tri_index < 2 ? _tri_index + 1 : 0;
-    if (_tri_buf_size[tri] < len)
-    {
-      _tri_buf_size[tri] = len;
-      if (_tri_buf[tri] != nullptr) { heap_caps_free(_tri_buf[tri]); }
-      auto tmp = (int16_t*)heap_caps_malloc(len, MALLOC_CAP_8BIT);
-      _tri_buf[tri] = tmp;
-      if (tmp == nullptr)
-      {
-        _tri_buf_size[tri] = 0;
-        return nullptr;
-      }
-    }
-    memcpy(_tri_buf[tri], src_data, len);
-    _tri_index = tri;
-    return _tri_buf[tri];
+    size_t idx = _index ^ 1;
+    while (_busy[idx]) { vTaskDelay(1); } // wait until the speaker task has released this buffer
+    if (len > sizeof(_buf[idx])) { len = sizeof(_buf[idx]); } // a longer packet than expected: keep what fits
+    memcpy(_buf[idx], src_data, len);
+    _index = idx;
+    return _buf[idx];
+  }
+
+  void play_buf(const int16_t* buf, uint32_t len)
+  {
+    if (len > sizeof(_buf[0])) { len = sizeof(_buf[0]); } // never queue more than the storage holds
+    if (len < 2) { return; }
+    // busy is set before playRaw: the release can only come after the
+    // request is queued. playRaw returns false when nothing was queued.
+    _busy[_index] = true;
+    if (!M5.Speaker.playRaw(buf, len >> 1, _sample_rate, true, 1, m5spk_virtual_channel)) { _busy[_index] = false; }
   }
 
   void audio_data_callback(const uint8_t *data, uint32_t length) override
   {
     // Reduce memory requirements by dividing the received data into the first and second halves.
     length >>= 1;
-    M5.Speaker.playRaw(get_next_buf( data        , length), length >> 1, _sample_rate, true, 1, m5spk_virtual_channel);
-    M5.Speaker.playRaw(get_next_buf(&data[length], length), length >> 1, _sample_rate, true, 1, m5spk_virtual_channel);
-    _export_index = _tri_index;
+    // separate statements: get_next_buf may shorten len, and the order in
+    // which call arguments are evaluated is unspecified.
+    uint32_t len = length;
+    auto buf = get_next_buf(data, len);
+    play_buf(buf, len);
+    len = length;
+    buf = get_next_buf(&data[length], len);
+    play_buf(buf, len);
+    _export_index = _index;
+    _silent = false;
   }
 };
 
@@ -588,6 +624,8 @@ void setup(void)
 
   M5.begin(cfg);
 
+  M5.Speaker.setBufferReleaseCallback(&a2dp_sink, BluetoothA2DPSink_M5Speaker::bufferReleased);
+  a2dp_sink.set_on_volumechange(BluetoothA2DPSink_M5Speaker::volumeChanged);
 
   { /// custom setting
     auto spk_cfg = M5.Speaker.config();
@@ -654,6 +692,7 @@ void loop(void)
     if (v <= 255)
     {
       M5.Speaker.setVolume(v);
+      a2dp_sink.set_volume(v * 127 / 255); // keep the phone's volume display in step
     }
   }
 }
