@@ -11,19 +11,35 @@
 #include <M5UnitLCD.h>
 #include <M5UnitOLED.h>
 #include <M5Unified.h>
+#include <atomic>
+#include <vector>
+#include <algorithm>
 
 /// set M5Speaker virtual channel (0-7)
 static constexpr uint8_t m5spk_virtual_channel = 0;
 
-/// set your mp3 filename
-static constexpr const char* filename[] =
+/// Every *.mp3 in this folder of the card is played, in name order.
+static constexpr const char* mp3_dir = "/mp3";
+static std::vector<String> filename;
+
+static void scanFiles(void)
 {
-  "/mp3/file01.mp3",
-  "/mp3/file02.mp3",
-  "/mp3/file03.mp3",
-  "/mp3/file04.mp3",
-};
-static constexpr const size_t filecount = sizeof(filename) / sizeof(filename[0]);
+  filename.clear();
+  auto dir = SD.open(mp3_dir);
+  if (!dir) { return; }
+  for (auto f = dir.openNextFile(); f; f = dir.openNextFile())
+  {
+    bool is_dir = f.isDirectory();
+    String name = f.name(); // a bare name or a full path, depending on the core version
+    f.close();
+    String lower = name;
+    lower.toLowerCase();
+    if (is_dir || !lower.endsWith(".mp3")) { continue; }
+    filename.push_back(name.startsWith("/") ? name : String(mp3_dir) + "/" + name);
+  }
+  dir.close();
+  std::sort(filename.begin(), filename.end());
+}
 
 class AudioOutputM5Speaker : public AudioOutput
 {
@@ -34,14 +50,26 @@ class AudioOutputM5Speaker : public AudioOutput
       _virtual_ch = virtual_sound_channel;
     }
     virtual ~AudioOutputM5Speaker(void) {};
+    /// Call once after M5.begin() and before anything plays on the speaker
+    /// (the callback may only be registered before the first request).
+    /// Not done in the constructor: at global construction M5 may not exist.
+    void setup(void)
+    {
+      // Buffers are used in rotation and one is refilled only after the
+      // speaker task has released it, which it reports through this callback.
+      // Two would be enough for that handshake; the third keeps one buffer of
+      // slack against decoder and network jitter, as the old three-buffer
+      // form had.
+      _m5sound->setBufferReleaseCallback(this, bufferReleased);
+    }
     virtual bool begin(void) override { return true; }
     virtual bool ConsumeSample(int16_t sample[2]) override
     {
-      if (_tri_buffer_index < tri_buf_size)
+      if (_buffer_index < buf_size)
       {
-        _tri_buffer[_tri_index][_tri_buffer_index  ] = sample[0];
-        _tri_buffer[_tri_index][_tri_buffer_index+1] = sample[1];
-        _tri_buffer_index += 2;
+        _buffer[_index][_buffer_index  ] = sample[0];
+        _buffer[_index][_buffer_index+1] = sample[1];
+        _buffer_index += 2;
 
         return true;
       }
@@ -51,29 +79,52 @@ class AudioOutputM5Speaker : public AudioOutput
     }
     virtual void flush(void) override
     {
-      if (_tri_buffer_index)
+      if (_buffer_index)
       {
-        _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch);
-        _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
-        _tri_buffer_index = 0;
+        // busy is set before playRaw: the release can only come after the
+        // request is queued. playRaw returns false when nothing was queued.
+        _busy[_index] = true;
+        if (!_m5sound->playRaw(_buffer[_index], _buffer_index, hertz, true, 1, _virtual_ch)) { _busy[_index] = false; }
+        if (++_index >= buf_count) { _index = 0; }
+        _buffer_index = 0;
+        while (_busy[_index]) { vTaskDelay(1); } // wait until the speaker task has released the next buffer
       }
     }
     virtual bool stop(void) override
     {
+      // Let the queued buffers play out rather than cutting them: after the
+      // last release nothing refers to the buffers any more.
       flush();
-      _m5sound->stop(_virtual_ch);
+      for (size_t i = 0; i < buf_count; ++i)
+      {
+        while (_busy[i]) { vTaskDelay(1); }
+      }
       return true;
     }
 
-    const int16_t* getBuffer(void) const { return _tri_buffer[(_tri_index + 2) % 3]; }
+    /// The most recently queued buffer, for the level/FFT display only: the
+    /// producer may start refilling it while it is being read, so a torn
+    /// frame is possible (as with any number of buffers when the reader lags).
+    const int16_t* getBuffer(void) const { return _buffer[(_index + buf_count - 1) % buf_count]; }
 
   protected:
     m5::Speaker_Class* _m5sound;
     uint8_t _virtual_ch;
-    static constexpr size_t tri_buf_size = 1536;
-    int16_t _tri_buffer[3][tri_buf_size];
-    size_t _tri_buffer_index = 0;
-    size_t _tri_index = 0;
+    static constexpr size_t buf_count = 3;
+    static constexpr size_t buf_size = 1536;
+    int16_t _buffer[buf_count][buf_size];
+    // These flags are shared between tasks. Use std::atomic<bool> here;
+    // plain bool or volatile does not safely share updates between tasks.
+    std::atomic<bool> _busy[buf_count] = { {false}, {false}, {false} };
+    size_t _buffer_index = 0;
+    size_t _index = 0;
+
+    static void bufferReleased(void* args, const void* data, uint8_t)
+    {
+      auto me = (AudioOutputM5Speaker*)args;
+      // The speaker has finished using this buffer; it can be refilled now.
+      for (size_t i = 0; i < buf_count; ++i) { if (data == me->_buffer[i]) { me->_busy[i] = false; } }
+    }
 };
 
 
@@ -455,6 +506,7 @@ void setup(void)
   cfg.external_speaker.atomic_spk     = true;
 
   M5.begin(cfg);
+  out.setup();
 
 
   { /// custom setting
@@ -474,7 +526,21 @@ void setup(void)
 
   gfxSetup(&M5.Display);
 
-  play(filename[fileindex]);
+  scanFiles();
+  if (filename.empty())
+  {
+    M5.Display.setCursor(0, 8);
+    M5.Display.printf("no *.mp3 in %s", mp3_dir);
+    for (;;) { M5.delay(1000); }
+  }
+  play(filename[fileindex].c_str());
+}
+
+static void playNext(void)
+{
+  stop();
+  if (++fileindex >= filename.size()) { fileindex = 0; }
+  play(filename[fileindex].c_str());
 }
 
 void loop(void)
@@ -483,7 +549,7 @@ void loop(void)
 
   if (mp3.isRunning())
   {
-    if (!mp3.loop()) { mp3.stop(); }
+    if (!mp3.loop()) { playNext(); } // end of file: on to the next one
   }
   else
   {
@@ -494,9 +560,7 @@ void loop(void)
   if (M5.BtnA.wasClicked())
   {
     M5.Speaker.tone(1000, 100);
-    stop();
-    if (++fileindex >= filecount) { fileindex = 0; }
-    play(filename[fileindex]);
+    playNext();
   }
   else
   if (M5.BtnA.isHolding() || M5.BtnB.isPressed() || M5.BtnC.isPressed())
