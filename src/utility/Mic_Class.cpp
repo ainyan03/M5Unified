@@ -788,8 +788,17 @@ if (_cfg.pin_bck < 0 || _cfg.pin_ws < 0) {
         dst_remain -= output_num;
         if ((int32_t)dst_remain <= 0)
         {
+          // data has been walked forward while filling: step back over what
+          // was written to hand the caller the pointer they gave record().
+          const size_t total = current_rec->length.load(std::memory_order_relaxed);
+          const size_t written = total - dst_remain; // dst_remain may have wrapped below 0
+          void* released = (uint8_t*)current_rec->data - written * (current_rec->is_16bit ? 2 : 1);
           current_rec->length.store(0, std::memory_order_release);
           xSemaphoreGive(self->_task_semaphore);
+          if (self->_cb_buffer_release)
+          {
+            self->_cb_buffer_release(self->_cb_buffer_release_args, released, total);
+          }
           break;
         }
       }
@@ -859,6 +868,13 @@ if (_cfg.pin_bck < 0 || _cfg.pin_ws < 0) {
         _begin_lock.store(false);
         return 0;
       }
+      if (rate != _cfg.sample_rate
+       && xTaskGetCurrentTaskHandle() == _task_handle.load(std::memory_order_acquire))
+      { // the capture task (release callback) cannot rebuild itself: refuse
+        // before the rate is committed, so the live rate stays usable.
+        _begin_lock.store(false);
+        return 0;
+      }
       _cfg.sample_rate = rate;
     }
     if (_begun.load(std::memory_order_acquire) && _rec_sample_rate == _calc_rec_rate())
@@ -879,6 +895,11 @@ if (_cfg.pin_bck < 0 || _cfg.pin_ws < 0) {
           // The caller waits outside and retries.
           _begin_lock.store(false);
           return -1;
+        }
+        if (xTaskGetCurrentTaskHandle() == _task_handle.load(std::memory_order_acquire))
+        { // the capture task (release callback) cannot rebuild itself.
+          _begin_lock.store(false);
+          return 0;
         }
         _end_locked();
         _rec_sample_rate = rate;
@@ -1038,17 +1059,23 @@ if (_cfg.pin_bck < 0 || _cfg.pin_ws < 0) {
     // to drain or for the capture side to make progress. The retry has no
     // fairness order - competing callers that keep requesting conflicting
     // sample rates can hold each other off indefinitely.
+    // From the release callback (the capture task itself) nothing may be
+    // waited for: an end() holding _rec_lock waits for this task to exit, and
+    // a free slot only comes from this task. Try once and report.
+    const bool in_task = (xTaskGetCurrentTaskHandle() == _task_handle.load(std::memory_order_acquire));
     for (;;)
     {
       bool zero = false;
       while (!_rec_lock.compare_exchange_strong(zero, true))
       {
+        if (in_task) { return false; }
         zero = false;
         vTaskDelay(1);
       }
       int result = _rec_try_locked(recdata, array_len, flg_16bit, sample_rate, flg_stereo);
       _rec_lock.store(false);
       if (result >= 0) { return result; }
+      if (in_task) { return false; }
       xSemaphoreTake(_task_semaphore, 1);
     }
   }

@@ -126,6 +126,29 @@ namespace m5
     /// @return 0=not recording / 1=recording (There's room in the queue) / 2=recording (There's no room in the queue.)
     size_t isRecording(void) const volatile { return ((bool)_rec_info[0].length.load(std::memory_order_acquire)) + ((bool)_rec_info[1].length.load(std::memory_order_acquire)); }
 
+    /// Register a function called when the capture task has filled a buffer
+    /// given to record(): from then on the caller may read or reuse it. Two
+    /// buffers used alternately are enough when the next record() is issued
+    /// from this point.
+    /// @param args passed through as the first argument.
+    /// @param func (args, data, length): data is the pointer given to record(),
+    ///             length its array_len.
+    /// @attention Called from the capture task, not an ISR: keep it short,
+    ///            never block in it, never call begin()/end() from it.
+    /// @attention Requests dropped by end() do not call back. Delivery follows
+    ///            the slot release, so it can arrive after isRecording() has
+    ///            already dropped: track buffers by pointer, not by counting.
+    /// @attention record() may be called from within at the current sample
+    ///            rate: it never waits there and returns false if the queue is
+    ///            full or a begin()/end() is in progress. A different rate is
+    ///            refused there (it would rebuild the calling task) and leaves
+    ///            the current rate untouched.
+    /// @attention Set or clear it only before the first record() or after
+    ///            end() has returned - not merely while isRecording() is 0:
+    ///            the task may still be about to call the previous function,
+    ///            and the function and args are not swapped as one unit.
+    void setBufferReleaseCallback(void* args, void (*func)(void* args, void* data, size_t length)) { _cb_buffer_release_args = args; _cb_buffer_release = func; }
+
     /// set recording sampling rate. Not synchronized: to change the rate
     /// while other tasks may be recording, pass it to record() instead.
     /// @param sample_rate the sampling rate (Hz)
@@ -212,6 +235,8 @@ namespace m5
 
     bool (*_cb_set_enabled)(void* args, bool enabled) = nullptr;
     void* _cb_set_enabled_args = nullptr;
+    void (*_cb_buffer_release)(void* args, void* data, size_t length) = nullptr;
+    void* _cb_buffer_release_args = nullptr;
 
     int32_t _offset = 0;
     /// Written by begin()/end(), polled by the capture task: atomic so the
