@@ -348,7 +348,13 @@ namespace m5
       // Skipped when the application already ran Display.init(): GPIO46 may then carry the display
       // bus (StopWatch QSPI io2), which this output would overwrite. The hold is applied below,
       // once the pin map is known, only on boards that use GPIO46 as their power hold.
+#if defined (BOARD_ID) && ((BOARD_ID + 0) > 0)
+      // A fixed board can use GPIO46 for its display rather than power hold.
+      const bool gpio46_hold = Display.getBoard() == board_t::board_unknown
+                           && _get_power_hold_pin(static_cast<board_t>(BOARD_ID)) == GPIO_NUM_46;
+#else
       const bool gpio46_hold = (Display.getBoard() == m5gfx::board_t::board_unknown);
+#endif
       m5gfx::gpio::pin_backup_t gpio46_backup(GPIO_NUM_46);
       if (gpio46_hold)
       {
@@ -359,6 +365,10 @@ namespace m5
 
       m5gfx::detect_config_t detect_config;
       detect_config.fallback_board = cfg.fallback_board;
+      // A positive BOARD_ID fixes the device to its board_t value in M5Unified.
+#if defined (BOARD_ID) && ((BOARD_ID + 0) > 0)
+      detect_config.fixed_board = static_cast<board_t>(BOARD_ID);
+#endif
       Display.setDetectConfig(detect_config);
       auto brightness = Display.getBrightness();
       Display.setBrightness(0);
@@ -368,20 +378,21 @@ namespace m5
       } else {
         res = Display.init_without_reset(false);
       }
-      auto board = Display.getBoard();
-      // printf("auto detect board:%d\n",board);
+      const auto fixed_board = Display.getFixedBoard();
+      auto board = fixed_board != board_t::board_unknown ? fixed_board : Display.getBoard();
       bool board_detected = (board != board_t::board_unknown);
-      if (!board_detected)
+      if (fixed_board != board_t::board_unknown)
+      {
+        // Accepted firmware identity survives display startup failure.
+        if (cfg.fallback_board != board_t::board_unknown && cfg.fallback_board != fixed_board)
+        {
+          Log(ESP_LOG_WARN, "fallback board:%u ignored for fixed board:%u",
+              static_cast<unsigned>(cfg.fallback_board), static_cast<unsigned>(fixed_board));
+        }
+      }
+      else if (!board_detected)
       {
         board = cfg.fallback_board;
-        // UIFlow selects board-specific firmware with BOARD_ID and M5GFX_BOARD.
-#if defined (CONFIG_IDF_TARGET_ESP32P4) && defined (BOARD_ID)
-#if BOARD_ID == 31
-        if (board == board_t::board_unknown) { board = board_t::board_M5CoreP4X; }
-#elif BOARD_ID == 35
-        if (board == board_t::board_unknown) { board = board_t::board_M5Tab5X; }
-#endif
-#endif
         if (board == board_t::board_unknown) { board = Display.getBoardCandidate(); }
         if (board == board_t::board_unknown) { board = _default_fallback_board(); }
       }
@@ -801,6 +812,7 @@ namespace m5
     bool _probe_i2c_addr(uint8_t sda, uint8_t scl, uint8_t addr);
 
     static void _setup_pinmap(board_t);
+    static int8_t _get_power_hold_pin(board_t);
     static bool _speaker_enabled_cb_core2(void* args, bool enabled);
     static bool _speaker_enabled_cb_cores3(void* args, bool enabled);
     static bool _speaker_enabled_cb_sticks3(void* args, bool enabled);

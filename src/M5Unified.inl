@@ -86,6 +86,8 @@ namespace m5
 int8_t M5Unified::_get_pin_table[pin_name_max];
 
 #if defined (M5UNIFIED_PC_BUILD)
+  int8_t M5Unified::_get_power_hold_pin(board_t) { return -1; }
+
   void M5Unified::_setup_pinmap(board_t)
   {
     std::fill(_get_pin_table, _get_pin_table + pin_name_max, 255);
@@ -474,6 +476,13 @@ static constexpr const uint8_t _pin_table_mbus[][31] = {
 #endif
 { board_t::board_unknown  , 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255 },
 };
+
+  int8_t M5Unified::_get_power_hold_pin(board_t id)
+  {
+    for (const auto& row : _pin_table_other1)
+    { if (row[0] == id) { return static_cast<int8_t>(row[1]); } }
+    return -1;
+  }
 
   void M5Unified::_setup_pinmap(board_t id)
   {
@@ -1654,9 +1663,6 @@ static constexpr const uint8_t _pin_table_mbus[][31] = {
     if (pkg == EFUSE_RD_CHIP_VER_PKG_ESP32D0WDQ6) { return board_t::board_M5TimerCam; }
     return board_t::board_M5AtomLite;
 #elif defined (CONFIG_IDF_TARGET_ESP32S3)
-#if defined (BOARD_ID) && BOARD_ID == 147
-    return board_t::board_M5DualKey;
-#endif
     // ESP32-S3 package 0 is QFN56 and package 1 is LGA56.
     if (m5gfx::get_pkg_ver() == 1) { return board_t::board_M5StampS3Mini; }
     return board_t::board_M5StampS3;
