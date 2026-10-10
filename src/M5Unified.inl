@@ -1659,27 +1659,20 @@ static constexpr const uint8_t _pin_table_mbus[][31] = {
     const auto pkg = m5gfx::get_pkg_ver();
     if (pkg == 6) { return board_t::board_M5AtomPsram; } // PICO-V3
     if (pkg == 5) { return board_t::board_M5StampPico; } // PICO-D4
-    // The legacy detector defaulted D0WDQ6 to TimerCam after other probes failed.
-    if (pkg == EFUSE_RD_CHIP_VER_PKG_ESP32D0WDQ6) { return board_t::board_M5TimerCam; }
-    return board_t::board_M5AtomLite;
+    // StampPico and AtomPsram have no positive detector and remain defaults.
+    // All D0WDQ6 members have detectors; other packages have no M5 boards.
+    // Do not assume a rejected member. Unknown retains the generic I2C map.
+    return board_t::board_unknown;
 #elif defined (CONFIG_IDF_TARGET_ESP32S3)
     // ESP32-S3 package 0 is QFN56 and package 1 is LGA56.
     if (m5gfx::get_pkg_ver() == 1) { return board_t::board_M5StampS3Mini; }
     return board_t::board_M5StampS3;
 #elif defined (CONFIG_IDF_TARGET_ESP32C3)
     return board_t::board_M5StampC3U;
-#elif defined (CONFIG_IDF_TARGET_ESP32C6)
-    // Preserve legacy package/flash defaults when no detector confirms a board.
-    if (m5gfx::get_pkg_ver() == 1)
-    {
-      return REG_GET_FIELD(EFUSE_RD_MAC_SPI_SYS_4_REG, EFUSE_FLASH_CAP) == 2
-           ? board_t::board_M5StampC6 : board_t::board_M5NanoC6;
-    }
+#elif defined (CONFIG_IDF_TARGET_ESP32C6) || defined (CONFIG_IDF_TARGET_ESP32H2) || defined (CONFIG_IDF_TARGET_ESP32C5)
+    // Package-only Stamp suggestions arrive as detector candidates. Do not
+    // assume a Nano or Stamp after its positive detector rejects the board.
     return board_t::board_unknown;
-#elif defined (CONFIG_IDF_TARGET_ESP32H2)
-    return board_t::board_M5NanoH2;
-#elif defined (CONFIG_IDF_TARGET_ESP32C5)
-    return board_t::board_M5StampC5;
 #elif defined (CONFIG_IDF_TARGET_ESP32P4)
     // Unidentified P4 modules have no display or board-specific power contract.
     esp_chip_info_t info;
