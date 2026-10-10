@@ -357,6 +357,9 @@ namespace m5
       }
 #endif
 
+      m5gfx::detect_config_t detect_config;
+      detect_config.fallback_board = cfg.fallback_board;
+      Display.setDetectConfig(detect_config);
       auto brightness = Display.getBrightness();
       Display.setBrightness(0);
       bool res = false;
